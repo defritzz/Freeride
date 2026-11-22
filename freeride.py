@@ -33,7 +33,7 @@ API = "https://api.open-meteo.com/v1/forecast"
 TZ = "Europe/Zurich"
 # MeteoSwiss ICON is het fijnst voor de Alpen, ECMWF/ICON/GFS geven spreiding.
 MODELS = ["meteoswiss_icon_seamless", "ecmwf_ifs025", "icon_seamless", "gfs_seamless"]
-HOURLY = ["temperature_2m", "precipitation", "freezing_level_height", "wind_speed_10m",
+HOURLY = ["temperature_2m", "precipitation", "snowfall", "freezing_level_height", "wind_speed_10m",
           "wind_gusts_10m", "wind_direction_10m", "cloud_cover", "snow_depth"]
 BASE_HOURLY = ["temperature_2m", "precipitation"]  # tweede ronde, op de hoogte van het dal
 
@@ -131,10 +131,11 @@ def mock_batch(batch, days, models, hourly_vars, elev):
                 p = math.exp(-((d - 2.6) / 0.6) ** 2) + 0.7 * math.exp(-((d - 5.9) / 0.5) ** 2)
                 diurn = 2.5 * math.sin((i % 24 - 9) / 24 * 2 * math.pi)
                 temp = -4.5 - 6.5 * (e - 2000) / 1000 + 3 * p + diurn
-                precip = max(0, 0.24 * p * west * (0.5 + alt) * bias * (0.7 + 0.6 * rnd.random()))
-                depth += precip / 10 * 0.8 if temp < 1 else 0
+                precip = max(0, 2.2 * p * west * (0.5 + alt) * bias * (0.7 + 0.6 * rnd.random()))  # mm per uur
+                depth += precip / 100 if temp < 1 else 0
                 cols["temperature_2m"].append(round(temp, 1))
                 cols["precipitation"].append(round(precip, 2))
+                cols["snowfall"].append(round(precip * 0.7 if temp < 1.5 else 0.0, 2))
                 cols["freezing_level_height"].append(round(1900 - 850 * p + rnd.uniform(-60, 60)))
                 cols["wind_speed_10m"].append(round(12 + 35 * p + rnd.uniform(0, 6), 1))
                 cols["wind_gusts_10m"].append(round(22 + 60 * p + rnd.uniform(0, 8), 1))
@@ -153,18 +154,26 @@ def avg(x):
 
 
 def stat(per_model):
+    # (mediaan, laagste, hoogste, lijst per model). Een model dat meer dan 2,5x de mediaan geeft
+    # telt niet mee voor het bereik, zodat een uitschieter de cijfers niet vertekent.
     if not per_model:
-        return (0.0, 0.0, 0.0)
-    return (sum(per_model) / len(per_model), min(per_model), max(per_model))
+        return (0.0, 0.0, 0.0, [])
+    s = sorted(per_model)
+    k = len(s)
+    med = s[k // 2] if k % 2 else (s[k // 2 - 1] + s[k // 2]) / 2
+    keep = [v for v in per_model if med <= 10 or v <= 2.5 * med] or per_model
+    return (med, min(keep), max(keep), list(per_model))
 
 
-def collect(h, var, models):
+def collect(h, var, models, names=None):
     lists = []
     for m in models:
         for key in (f"{var}_{m}", var):
             v = h.get(key)
             if v is not None and any(x is not None for x in v):
                 lists.append(v)
+                if names is not None:
+                    names.append(m)
                 break
     return lists
 
@@ -222,8 +231,9 @@ def score_day(d, top_m):
 
 
 def ratio(t):
-    # cm sneeuw per mm neerslag, afhankelijk van de temperatuur
-    return 14 if t <= -8 else 11 if t <= -4 else 9 if t <= -1 else 7
+    # cm sneeuw per mm neerslag (1 mm water = ongeveer 1 cm sneeuw, droger bij kou, natter rond 0 graden).
+    # Ter vergelijking: Open-Meteo zelf rekent met 0,7 cm per mm.
+    return 1.3 if t <= -6 else 1.0 if t <= -2 else 0.8 if t <= 0.5 else 0.6
 
 
 def snow_series(L, n):
@@ -233,7 +243,7 @@ def snow_series(L, n):
 
     def one(l, i):
         t = T[i]
-        return l[i] * ratio(t) if (t is not None and t <= 1.0 and i < len(l) and l[i]) else 0.0
+        return min(l[i] * ratio(t), 5.0) if (t is not None and t <= 1.0 and i < len(l) and l[i]) else 0.0
 
     def hour(i):
         return sum(one(l, i) for l in P) / len(P) if P else 0.0
@@ -256,7 +266,9 @@ def analyse(resort, raw, raw_base, models, ndays):
     h = raw["hourly"]
     times = h["time"]
     n = len(times)
-    L = {v: collect(h, v, models) for v in HOURLY}
+    names_P, names_S = [], []
+    names_map = {"precipitation": names_P, "snowfall": names_S}
+    L = {v: collect(h, v, models, names_map.get(v)) for v in HOURLY}
     T, hour, snow_sum, _ = snow_series(L, n)
     S = [hour(i) for i in range(n)]
     cold = [t is not None and t <= 1.0 for t in T]
@@ -264,6 +276,11 @@ def analyse(resort, raw, raw_base, models, ndays):
     if raw_base:
         LB = {v: collect(raw_base["hourly"], v, models) for v in BASE_HOURLY}
         _, _, snow_sum_b, rain_b = snow_series(LB, n)
+
+    def native(a, b):
+        # Open-Meteo's eigen sneeuwcijfer per model (ter controle van mijn omrekening)
+        a, b = max(a, 0), min(b, n)
+        return [sum((l[i] or 0.0) for i in range(a, min(b, len(l)))) for l in L["snowfall"]]
 
     def vals(var, i):
         return [l[i] for l in L[var] if i < len(l) and l[i] is not None]
@@ -312,7 +329,7 @@ def analyse(resort, raw, raw_base, models, ndays):
         if d["rain_b"] >= 3:
             d["flags"].append(f"onderaan regen (ca. {d['rain_b']:.0f} mm): natte, zware afdaling naar het dal")
         days.append(d)
-    return {"r": resort, "days": days, "ahead": None, "ahead_b": None, "now_i": now_i,
+    return {"r": resort, "days": days, "ahead": None, "ahead_b": None, "now_i": now_i, "models_P": names_P, "models_S": names_S, "native_fn": native,
             "snow_fn": snow_sum, "snow_fn_b": snow_sum_b}
 
 
@@ -331,7 +348,8 @@ def attach_ahead(results, hours):
         a = x["now_i"]
         x["ahead"] = x["snow_fn"](a, a + hours)
         x["ahead_b"] = x["snow_fn_b"](a, a + hours) if x["snow_fn_b"] else None
-        x["snow_fn"] = x["snow_fn_b"] = None
+        x["native"] = dict(zip(x["models_S"], x["native_fn"](a, a + hours)))
+        x["snow_fn"] = x["snow_fn_b"] = x["native_fn"] = None
 
 
 # ----------------------------------------------------------------- melding
@@ -368,6 +386,8 @@ def build_message(top, best, hours, ndays):
         dal = f", dal {d['fresh_b'][0]:.0f} cm" if d["fresh_b"] else ""
         lines.append(f"- {dag} {dt.day}/{dt.month}: {x['r']['name']}, score {sc}/100, "
                      f"{d['fresh'][0]:.0f} cm vers boven{dal}, {d['status']}")
+    if top and top[0]["ahead"][0] > 120:
+        lines += ["", "Let op: zulke hoge cijfers kunnen een modelfout zijn. Kijk in het rapport bij Modelcontrole."]
     lines.append("")
     lines.append("Indicatie op basis van weermodellen. Lees altijd het SLF-lawinebulletin en check de liftstatus.")
     return "\n".join(lines)
@@ -482,8 +502,88 @@ BORDER = [tuple(float(v) for v in p.split(",")) for p in """
 6.963,46.031 6.981,46.019 6.985,46.006 7.011,45.996 7.023,45.979 7.009,45.968 7.037,45.955 7.035,45.938
 7.045,45.922 7.095,45.876 7.102,45.859 7.118,45.859 7.154,45.879 7.191,45.859 7.201,45.863 7.200,45.876
 """.split()]
-CITIES = [("Genève", 6.14, 46.20), ("Lausanne", 6.63, 46.52), ("Bern", 7.45, 46.95),
-          ("Sion", 7.36, 46.23), ("Luzern", 8.31, 47.05), ("Zürich", 8.54, 47.37)]
+def _roads(enc):
+    return [[tuple(float(v) for v in q.split(",")) for q in seg.split()] for seg in enc.split(";")]
+
+
+ROADS_MAJOR = _roads("""
+6.868,47.590 6.851,47.507 6.833,47.480 6.803,47.459 6.768,47.448 6.611,47.427 6.518,47.422 6.463,47.404
+6.383,47.404 6.338,47.371 6.296,47.358 6.173,47.341 6.010,47.301 5.970,47.286 5.914,47.257 5.872,47.220
+5.827,47.196 5.780,47.188 5.721,47.185;8.215,47.451 8.138,47.468 8.065,47.527 8.012,47.552 7.958,47.559
+7.844,47.562 7.789,47.578;8.215,47.451 8.154,47.427 8.124,47.389 7.979,47.332 7.910,47.313;9.080,47.477
+9.032,47.466 8.986,47.467 8.859,47.526 8.785,47.540 8.726,47.542 8.695,47.535 8.680,47.521 8.680,47.513
+8.704,47.487 8.711,47.470 8.697,47.441 8.681,47.426 8.640,47.408 8.539,47.389 8.476,47.391 8.312,47.450
+8.252,47.453 8.215,47.451;8.610,46.939 8.573,46.951 8.438,46.981 8.400,46.981 8.352,46.970 8.322,46.973
+8.299,46.988 8.295,47.014;7.899,47.310 7.919,47.287 7.942,47.246 7.977,47.211 8.003,47.196 8.039,47.185
+8.077,47.183 8.131,47.190 8.144,47.187 8.195,47.148 8.267,47.112 8.288,47.091 8.291,47.066;8.594,46.566
+8.614,46.552 8.634,46.546 8.698,46.538 8.737,46.526 8.839,46.448 8.862,46.419 8.883,46.376 8.957,46.331
+8.986,46.299 8.995,46.279 9.012,46.214;9.012,46.222 8.999,46.193 8.966,46.170 8.945,46.146 8.931,46.104
+8.926,46.065 8.927,46.026 8.935,45.987 8.958,45.944 8.994,45.915 8.998,45.905 8.991,45.880 8.963,45.870
+8.977,45.859 9.033,45.845 9.047,45.801 9.045,45.767 9.010,45.703;6.311,46.107 6.331,46.138 6.332,46.152
+6.326,46.160 6.292,46.180 6.220,46.195 6.182,46.195 6.145,46.188 6.130,46.178 6.110,46.149
+6.091,46.138;6.859,45.915 6.849,45.928 6.805,45.924 6.731,45.938 6.681,45.938 6.660,45.944 6.643,45.968
+6.632,46.015 6.623,46.032 6.597,46.057 6.571,46.070 6.406,46.101 6.365,46.103 6.304,46.097;6.818,46.508
+6.870,46.485 6.895,46.459 6.950,46.328 6.986,46.268 7.074,46.168 7.103,46.143;7.103,46.143 7.150,46.140
+7.187,46.149 7.321,46.217 7.579,46.284;5.944,45.721 5.948,45.749 5.956,45.767 5.983,45.802 6.121,45.931
+6.126,45.979 6.135,45.999 6.148,46.004 6.207,46.013 6.291,46.050 6.298,46.057 6.302,46.089
+6.311,46.107;7.408,46.938 7.320,46.899 7.204,46.869 7.163,46.845 7.130,46.811 7.105,46.772 7.070,46.675
+7.058,46.653 7.038,46.639 6.980,46.629 6.947,46.612 6.919,46.577 6.899,46.537 6.879,46.472;6.133,46.175
+6.125,46.231 6.136,46.269 6.251,46.430 6.294,46.465 6.328,46.478 6.398,46.492 6.487,46.537 6.565,46.552
+6.610,46.555 6.677,46.549 6.818,46.508;6.092,46.143 6.040,46.147 6.014,46.144 5.985,46.124 5.936,46.106
+5.910,46.073 5.893,46.066 5.880,46.071 5.863,46.087 5.829,46.143 5.809,46.162 5.762,46.177
+5.702,46.176;7.899,47.310 7.818,47.302 7.743,47.304 7.676,47.270 7.525,47.216 7.502,47.194
+7.496,47.164;8.767,47.536 8.911,47.585;8.468,47.393 8.442,47.377 8.435,47.363 8.433,47.348 8.437,47.311
+8.474,47.205;8.605,47.261 8.592,47.243 8.556,47.216 8.535,47.208 8.458,47.195 8.443,47.182 8.434,47.164
+8.434,47.144 8.440,47.125 8.453,47.108 8.488,47.079 8.565,47.064 8.590,47.052 8.600,47.036
+8.602,47.015;7.694,45.702 7.686,45.732 7.665,45.755 7.624,45.769 7.572,45.772 7.370,45.748 7.230,45.706
+7.179,45.703 7.041,45.729 7.028,45.740 6.997,45.790 6.982,45.798 6.934,45.810;8.446,45.903 8.515,45.875
+8.536,45.850 8.539,45.818 8.526,45.755 8.529,45.738 8.550,45.714 8.573,45.703 8.602,45.701 8.657,45.722
+8.674,45.724 8.733,45.705;8.537,45.726 8.506,45.701;7.496,47.164 7.497,47.137 7.486,47.065 7.455,47.025
+7.462,46.997 7.448,46.975 7.408,46.938;7.405,46.940 7.384,46.952 7.362,46.957 7.233,46.970 7.205,46.968
+7.155,46.950 7.099,46.910 7.014,46.901 6.927,46.865 6.876,46.836 6.820,46.820 6.757,46.780 6.610,46.753
+6.587,46.740 6.575,46.728;6.575,46.728 6.567,46.702 6.567,46.673 6.586,46.554;7.632,47.579 7.646,47.562
+7.669,47.546 7.706,47.537 7.745,47.538 7.828,47.561;8.516,47.382 8.535,47.328 8.565,47.289 8.596,47.263
+8.667,47.223 8.722,47.203 8.777,47.192 8.828,47.192 8.902,47.204 8.953,47.203 8.993,47.186 9.044,47.140
+9.082,47.123;7.501,47.183 7.460,47.168 7.364,47.158;7.032,47.046 6.888,46.998 6.778,46.914 6.655,46.843
+6.634,46.823 6.625,46.807 6.625,46.788 6.634,46.759;7.221,47.214 7.214,47.198 7.227,47.187 7.268,47.177
+7.402,47.161;7.080,47.444 7.164,47.394 7.200,47.380 7.230,47.373 7.358,47.363 7.396,47.345;7.841,46.684
+7.815,46.659 7.782,46.649 7.745,46.652 7.677,46.678 7.647,46.701 7.635,46.717 7.593,46.839 7.553,46.894
+7.536,46.907 7.497,46.925 7.445,46.937 7.408,46.938;7.754,47.537 7.828,47.458 7.843,47.421 7.849,47.375
+7.899,47.310;7.364,47.158 7.218,47.141;7.396,47.345 7.400,47.331 7.397,47.317 7.368,47.278 7.334,47.260
+7.267,47.239 7.220,47.215;8.613,47.416 8.786,47.362 8.799,47.351 8.830,47.302;8.589,46.938 8.627,46.879
+8.639,46.737 8.627,46.705 8.596,46.668;8.596,46.668 8.579,46.642 8.575,46.623 8.581,46.586
+8.594,46.566;8.602,47.015 8.599,46.973 8.605,46.915
+""")
+ROADS_SEC = _roads("""
+8.293,47.070 8.301,47.012;7.579,46.284 7.878,46.304 7.952,46.320 7.956,46.313;6.934,45.810 6.905,45.828
+6.894,45.840 6.867,45.901 6.850,45.922;7.957,46.315 7.998,46.293 8.045,46.222 8.085,46.192 8.140,46.184
+8.239,46.196 8.271,46.188 8.284,46.174 8.290,46.153 8.283,46.075 8.289,46.035 8.297,46.016 8.309,46.002
+8.334,45.991 8.414,45.986 8.439,45.975 8.446,45.959 8.440,45.913 8.447,45.903 8.459,45.898;7.910,47.313
+7.899,47.310;9.098,46.212 9.032,46.216;8.683,47.536 8.690,47.592;8.060,47.532 8.136,47.581 8.177,47.597
+8.234,47.597 8.312,47.561 8.466,47.561 8.513,47.543 8.533,47.521 8.575,47.446 8.601,47.425
+8.617,47.422;7.103,46.143 7.118,46.113 7.142,46.088 7.176,46.036 7.215,45.997 7.229,45.970 7.228,45.942
+7.197,45.894 7.192,45.875;7.192,45.875 7.179,45.842 7.178,45.825 7.218,45.822 7.285,45.803 7.309,45.785
+7.316,45.773 7.321,45.744;6.404,46.727 6.587,46.739;6.409,46.722 6.356,46.934 6.354,46.973 6.368,47.070
+6.362,47.098 6.348,47.123 6.328,47.143 6.285,47.169 6.079,47.235 6.009,47.270 5.983,47.292;5.989,47.297
+6.044,47.361 6.111,47.467 6.138,47.538 6.129,47.597;8.830,47.302 8.841,47.275 8.839,47.258 8.816,47.229
+8.777,47.197;8.434,47.165 8.420,47.165 8.394,47.155 8.311,47.099 8.301,47.087 8.295,47.067;8.874,45.785
+8.967,45.800 9.060,45.801;7.960,46.321 8.040,46.373 8.140,46.422 8.271,46.514 8.293,46.525 8.363,46.544
+8.485,46.601 8.564,46.627;8.564,46.627 8.798,46.679 8.829,46.693 8.884,46.733 8.920,46.748;6.869,47.591
+6.843,47.595 6.765,47.590 6.741,47.594;7.658,47.545 7.624,47.515 7.609,47.495 7.611,47.477
+7.632,47.456;8.297,47.067 8.198,47.048 8.160,47.048 8.125,47.056;6.943,45.728 6.984,45.746
+7.028,45.750;6.863,47.591 6.913,47.581 6.932,47.570 6.993,47.492;8.289,47.037 8.303,47.039 8.337,47.062
+8.369,47.075 8.488,47.079;5.717,46.836 5.748,46.831 5.770,46.819 5.883,46.786 5.909,46.772 5.929,46.741
+5.931,46.702 5.951,46.652 5.987,46.616 5.980,46.577 6.034,46.569 6.047,46.559 6.032,46.507 6.033,46.498
+6.040,46.491;6.039,46.491 6.092,46.493 6.105,46.474 6.101,46.455 6.058,46.399 6.058,46.356 6.068,46.317
+6.080,46.303 6.097,46.294 6.144,46.287;6.082,47.321 6.057,47.247 5.986,47.180 5.882,47.014 5.754,46.904
+5.718,46.847 5.711,46.828;8.818,45.821 8.789,45.778 8.785,45.743 8.789,45.707;8.299,47.010 8.264,46.908
+8.241,46.872 8.204,46.836 8.180,46.790 8.167,46.784 8.112,46.778 8.096,46.769 8.067,46.735 7.999,46.699
+7.950,46.681 7.925,46.677 7.849,46.680;8.395,47.419 8.409,47.432 8.427,47.439 8.478,47.438 8.515,47.428
+8.532,47.419 8.540,47.407 8.540,47.389
+""")
+CITIES = [("Genève", 6.14, 46.20), ("Lausanne", 6.63, 46.52), ("Bern", 7.45, 46.95), ("Sion", 7.36, 46.23),
+          ("Luzern", 8.31, 47.05), ("Zürich", 8.54, 47.37), ("Montreux", 6.91, 46.43), ("Martigny", 7.07, 46.10),
+          ("Brig", 7.99, 46.32), ("Interlaken", 7.86, 46.69), ("Fribourg", 7.15, 46.80)]
 LON0, LON1, LAT0, LAT1 = 5.8, 9.0, 45.8, 47.5
 STEPS = [(0.5, "h1"), (2, "h2"), (5, "h3"), (10, "h4"), (20, "h5"), (30, "h6"), (50, "h7"), (80, "h8")]
 LEGEND = [("0,5", "h1"), ("2", "h2"), ("5", "h3"), ("10", "h4"), ("20", "h5"), ("30", "h6"), ("50", "h7"), ("80+", "h8")]
@@ -556,6 +656,9 @@ def svg_map(results, di, W=420):
                 out.append(f'<text x="{px(r["lon"]) + 9:.1f}" y="{py(r["lat"]) + 12 + 11 * k:.1f}" class="lb">'
                            f'{escape(r["name"].split(" (")[0])} {v:.0f} cm</text>')
         out.append("</g>")
+    def road_d(lines):
+        return "".join("M" + "L".join(f"{px(a):.1f} {py(b):.1f}" for a, b in ln) for ln in lines)
+    out.append(f'<path d="{road_d(ROADS_SEC)}" class="rs"/><path d="{road_d(ROADS_MAJOR)}" class="rm"/>')
     out.append(f'<path d="{border}" class="bd"/>')
     for nm, lo, la in CITIES:
         out.append(f'<rect x="{px(lo) - 2:.1f}" y="{py(la) - 2:.1f}" width="4" height="4" class="city"/>'
@@ -585,7 +688,7 @@ th,td{padding:6px 8px;border-bottom:1px solid var(--ln);text-align:left;vertical
 .maps:not(.show-base) .base,.maps.show-base .top{display:none}
 svg{width:100%;height:auto;background:var(--bg);border-radius:8px}.ch{stroke:var(--ln);stroke-width:1;stroke-dasharray:3 3}
 .h1{fill:#cfe6ff}.h2{fill:#9fcbff}.h3{fill:#6fb0ff}.h4{fill:#3f8bf0}.h5{fill:#2f5fd0}.h6{fill:#6a3fc8}.h7{fill:#a02fb5}.h8{fill:#d6336c}
-svg path[class^="h"]{fill-opacity:.85}.bd{fill:none;stroke:var(--tx);stroke-width:1.3}
+svg path[class^="h"]{fill-opacity:.85}.bd{fill:none;stroke:var(--tx);stroke-width:1.3}.rm{fill:none;stroke:#c0392b;stroke-width:1.6;opacity:.9}.rs{fill:none;stroke:var(--mu);stroke-width:.9;opacity:.8}
 .dot{fill:var(--card);stroke:var(--tx);stroke-width:1}.dot.closed{fill:none;stroke-dasharray:2 1.5;opacity:.7}
 .gl{fill:var(--mu);font-size:9px}.city{fill:var(--mu)}.vl{fill:var(--tx);font-size:9px;font-weight:600}
 .lb{fill:var(--tx);font-size:11px;font-weight:700;paint-order:stroke;stroke:var(--card);stroke-width:3px}
@@ -634,7 +737,7 @@ def render(results, top, best, models, hours, out_path, ndays):
     for i in range(min(5, len(dates))):
         h.append(f"<div><h3>{lab[i]}</h3>{svg_map(results, i)}</div>")
     h.append("</div><p class='fine'>Kleur = geschatte nieuwe sneeuw (cm) over die dag, geïnterpoleerd tussen de gebieden en enkel getoond "
-             "binnen ~22 km van een gebied. Stip = gebied (gestippeld = nog dicht), cijfer = cm bij de grote gebieden. "
+             "binnen ~22 km van een gebied. Stip = gebied (gestippeld = nog dicht), cijfer = cm bij de grote gebieden. Rode lijn = snelweg, grijze lijn = hoofdweg. "
              "Dit is een model, geen meting.</p>"
              "<script>function sw(l){document.querySelector('.maps').classList.toggle('show-base',l==='base');"
              "document.getElementById('bt').classList.toggle('on',l==='top');document.getElementById('bb').classList.toggle('on',l==='base');}"
@@ -657,6 +760,22 @@ def render(results, top, best, models, hours, out_path, ndays):
         h.append("</tr>")
     h.append("</table></div><p class='fine'>Cel = score/100 en nieuwe sneeuw bovenaan die dag. Grijs = gebied dicht volgens de openingsdata in resorts.csv. "
              "Score is een eigen heuristiek (poeder 45, zon 20, wind 20, temperatuur 10, sneeuwdek 5).</p></section>")
+    h.append("<section class='card'><h2>Modelcontrole</h2><p class='fine' style='margin-top:0'>Nieuwe sneeuw (cm) in de komende "
+             f"{hours} uur per weermodel, voor de 5 gebieden met de meeste sneeuw. Wijkt één model sterk af, dan telt dat niet mee in het bereik. "
+             "De laatste kolom is het eigen sneeuwcijfer van Open-Meteo (gemeten op het rasterpunt van het model, vaak lager in de bergen): "
+             "mijn berekening mag tot ongeveer twee keer hoger liggen (Open-Meteo rekent heel voorzichtig, 0,7 cm per mm), maar bij een groter verschil klopt er iets niet.</p>"
+             "<div class='wrap'><table><tr><th>Gebied</th><th>Hoogte</th><th>Model</th><th>Berekend (cm)</th><th>Open-Meteo zelf (cm)</th></tr>")
+    for x in top[:5]:
+        names = x.get("models_P") or []
+        for label, st, el in (("boven", x["ahead"], x["r"]["top_m"]), ("dal", x["ahead_b"], x["r"]["base_m"])):
+            if not st:
+                continue
+            for k, v in enumerate(st[3]):
+                nm = names[k] if k < len(names) else f"model {k + 1}"
+                nat = x["native"].get(nm) if label == "boven" else None
+                natt = "-" if nat is None else f"{nat:.0f}"
+                h.append(f"<tr><td>{escape(x['r']['name'])}</td><td>{label} ({el} m)</td><td>{escape(nm)}</td><td>{v:.0f}</td><td>{natt}</td></tr>")
+    h.append("</table></div></section>")
     h.append("<p class='fine'>Dit is een weermodelindicatie, geen lawineadvies. Lees het SLF-bulletin (slf.ch) en check liftstatus en openingen bij de bergbaan.</p>")
     h.append("</main></body></html>")
     Path(out_path).write_text("".join(h), encoding="utf-8")
