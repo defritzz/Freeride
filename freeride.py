@@ -14,13 +14,16 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 
 try:
@@ -54,6 +57,109 @@ def load_resorts(path, max_tier):
             if r["tier"] <= max_tier:
                 rows.append(r)
     return rows
+
+
+# ------------------------------------------------------- live openingsstatus
+MP_URL = "https://www.magicpass.ch/fr/stations/opening?page={p}&sort=title&order=ASC"
+LIVE_META = {"ok": False, "time": "", "unmatched": [], "n": 0}
+ALIASES = {"gstaad": "bergbahnen-gstaad"}  # eigen naam -> naam op de Magic Pass-site (indien verschillend)
+
+
+def slugify(t):
+    t = unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+
+
+class _Cards(HTMLParser):
+    # Verzamelt de tekst van elke gebiedskaart (een link naar /stations/<naam>-<nummer>).
+    def __init__(self):
+        super().__init__()
+        self.cards, self._cur, self._buf = {}, None, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and self._cur is None:
+            m = re.search(r"/stations/([a-z0-9-]+?)-(\d+)/?$", dict(attrs).get("href") or "")
+            if m:
+                self._cur, self._buf = m.group(1), []
+
+    def handle_data(self, data):
+        if self._cur is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._cur is not None:
+            self.cards[self._cur] = " ".join(" ".join(self._buf).split())
+            self._cur = None
+
+
+def parse_card(text):
+    num = r"(\d+(?:[.,]\d+)?)"
+    f = lambda x: float(x.replace(",", "."))
+    lifts = re.search(r"Installations ouvertes\s*(\d+)\s*/\s*(\d+)", text)
+    km = re.search(r"Pistes ouvertes\s*" + num + r"\s*/\s*" + num + r"\s*km", text)
+    ouv = re.search(r"Ouverture\s*:\s*(.*?)(?:Installations ouvertes|$)", text)
+    return {"lifts": (int(lifts.group(1)), int(lifts.group(2))) if lifts else None,
+            "km": (f(km.group(1)), f(km.group(2))) if km else None,
+            "ouverture": ouv.group(1).strip(" *") if ouv else ""}
+
+
+def fetch_magicpass_live(url=MP_URL, max_pages=15):
+    live = {}
+    try:
+        for pg in range(1, max_pages + 1):
+            req = urllib.request.Request(url.format(p=pg), headers={
+                "User-Agent": "Mozilla/5.0 (compatible; magicpass-freeride/1.0)", "Accept-Language": "fr"})
+            html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+            parser = _Cards()
+            parser.feed(html)
+            new = {k: v for k, v in parser.cards.items() if k not in live}
+            if not new:
+                break
+            live.update({k: parse_card(v) for k, v in new.items()})
+            time.sleep(1)
+    except Exception as e:
+        print(f"Magic Pass-openingen niet opgehaald ({e}); ik gebruik resorts.csv.", file=sys.stderr)
+    return live
+
+
+def find_live(name, live):
+    k = slugify(name)
+    k = ALIASES.get(k, k)
+    if k in live:
+        return live[k]
+    for sl, v in live.items():
+        if sl.startswith(k + "-") or k.startswith(sl + "-"):
+            return v
+    return None
+
+
+def attach_live(resorts, live):
+    ok = len(live) >= 10
+    miss = []
+    for r in resorts:
+        info = find_live(r["name"], live) if ok else None
+        r["live"] = info
+        if ok and info is None:
+            miss.append(r["name"])
+    LIVE_META.update(ok=ok, time=now_local().strftime("%H:%M"), unmatched=miss, n=len(live))
+    if ok:
+        print(f"Magic Pass live: {len(live)} gebieden gelezen, {len(resorts) - len(miss)} gekoppeld"
+              + (f", niet gevonden: {', '.join(miss)}" if miss else ""))
+    else:
+        print("Magic Pass live: geen bruikbare gegevens, ik gebruik de openingsdata uit resorts.csv.")
+
+
+def live_txt(r):
+    i = r.get("live")
+    if not i:
+        return ""
+    parts = []
+    if i.get("km"):
+        parts.append(f"pistes {i['km'][0]:g}/{i['km'][1]:g} km")
+    if i.get("lifts"):
+        parts.append(f"liften {i['lifts'][0]}/{i['lifts'][1]}")
+    return ", ".join(parts)
+
 
 
 def api_get(params, tries=3):
@@ -323,7 +429,7 @@ def analyse(resort, raw, raw_base, models, ndays):
             "fl_min": min(window("freezing_level_height", b, b + 24) or [0]),
             "depth": depth * 100 if depth is not None else None,
             "lee": lee,
-            "status": status_on(resort, ds),
+            "status": status_on(resort, ds, today),
         }
         d["score"], d["flags"] = score_day(d, resort["top_m"])
         if d["rain_b"] >= 3:
@@ -333,7 +439,20 @@ def analyse(resort, raw, raw_base, models, ndays):
             "snow_fn": snow_sum, "snow_fn_b": snow_sum_b}
 
 
-def status_on(r, ds):
+def status_on(r, ds, today=None):
+    # Vandaag telt de live status van Magic Pass (pistes open of niet). Voor latere dagen gelden enkel
+    # nog geplande openingsdata die na vandaag liggen, tenzij het gebied nu al open is.
+    info = r.get("live")
+    if info and info.get("km") is not None and today:
+        if info["km"][0] > 0:
+            return "open"
+        if ds == today:
+            return "dicht"
+        if r["opens"] and r["opens"] > today and ds >= r["opens"]:
+            return "open"
+        if r["maybe"] and r["maybe"] > today and ds >= r["maybe"]:
+            return "mogelijk"
+        return "dicht"
     if r["opens"] and ds >= r["opens"]:
         return "open"
     if r["maybe"] and ds >= r["maybe"]:
@@ -376,7 +495,8 @@ def build_message(top, best, hours, ndays):
             extra = f", sneeuwgrens ~{round(d0['fl_min'], -2):.0f} m, wind tot {d0['gust']:.0f} km/u"
             if d0["lee"]:
                 extra += f", stuifsneeuw {'/'.join(d0['lee'])}"
-        lines.append(f"- {r['name']} ({d0['status'] if d0 else '?'}): bovenaan ({r['top_m']} m) "
+        lt = live_txt(r)
+        lines.append(f"- {r['name']} ({(d0['status'] if d0 else '?') + (', ' + lt if lt else '')}): bovenaan ({r['top_m']} m) "
                      f"+{a[0]:.0f} cm ({a[1]:.0f}-{a[2]:.0f}){dal}{extra}")
     lines.append("")
     lines.append(f"Beste freeride-dagen (open of mogelijk open) in de komende {ndays} dagen:")
@@ -703,6 +823,23 @@ def fmt(st):
     return "-" if not st else f"+{st[0]:.0f} cm ({st[1]:.0f}-{st[2]:.0f})"
 
 
+def opening_card(results):
+    m = LIVE_META
+    if not m["ok"]:
+        return ("<section class='card'><h2>Openingen</h2><p class='fine' style='margin:0'>De live openingsstatus van Magic Pass kon niet worden "
+                "opgehaald. Ik gebruik de data in resorts.csv, die verouderd kan zijn. Check magicpass.ch/fr/stations/opening.</p></section>")
+    rows = sorted([x for x in results if (x["r"].get("live") or {}).get("km") and x["r"]["live"]["km"][0] > 0],
+                  key=lambda x: -x["r"]["live"]["km"][0])
+    li = "".join(f"<li><b>{escape(x['r']['name'])}</b>: {escape(live_txt(x['r']))}</li>" for x in rows) or "<li>Geen enkel gebied heeft nu pistes open.</li>"
+    miss = ""
+    if m["unmatched"]:
+        miss = ("<p class='fine'>Niet teruggevonden op de Magic Pass-pagina (data uit resorts.csv): "
+                + escape(", ".join(m["unmatched"])) + ".</p>")
+    return (f"<section class='card'><h2>Nu open volgens Magic Pass</h2><ul>{li}</ul>"
+            f"<p class='fine'>Live opgehaald om {m['time']} bij Magic Pass (installaties en kilometer piste open). "
+            f"Een gebied met 0 km piste telt als dicht voor skiën. Voor latere dagen gelden de geplande openingsdata uit resorts.csv.</p>{miss}</section>")
+
+
 def render(results, top, best, models, hours, out_path, ndays):
     gen = now_local().strftime("%d/%m/%Y %H:%M")
     dates = [d["date"] for d in results[0]["days"]]
@@ -721,12 +858,13 @@ def render(results, top, best, models, hours, out_path, ndays):
     if not best:
         h.append("<li>Geen enkel gebied is open of mogelijk open in deze periode.</li>")
     h.append("</ul></section>")
+    h.append(opening_card(results))
     h.append(f"<section class='card'><h2>Sneeuw op komst, komende {hours} uur</h2><div class='wrap'><table>"
              "<tr><th>Gebied</th><th>Status</th><th>Bovenaan</th><th>Onderaan (dal)</th><th>Sneeuwgrens</th><th>Windstoten</th><th>Lijzijde</th></tr>")
     for x in top:
         d0 = x["days"][0]
         r = x["r"]
-        h.append(f"<tr><td>{escape(r['name'])}</td><td>{d0['status']}</td><td>{r['top_m']} m: {fmt(x['ahead'])}</td>"
+        h.append(f"<tr><td>{escape(r['name'])}</td><td>{d0['status']}<br><span class='fine'>{escape(live_txt(r))}</span></td><td>{r['top_m']} m: {fmt(x['ahead'])}</td>"
                  f"<td>{r['base_m']} m: {fmt(x['ahead_b'])}</td><td>{d0['fl_min']:.0f} m</td><td>{d0['gust']:.0f} km/u</td>"
                  f"<td>{'/'.join(d0['lee']) if d0['lee'] else '-'}</td></tr>")
     h.append("</table></div></section><section class='card'><h2>Sneeuwkaarten: nieuwe sneeuw per dag (cm)</h2>"
@@ -750,7 +888,7 @@ def render(results, top, best, models, hours, out_path, ndays):
     for x in order:
         r = x["r"]
         tip = escape(r.get("note") or "")
-        h.append(f"<tr><td title='{tip}'>{escape(r['name'])}</td><td>{r['top_m']}</td><td>{x['days'][0]['status']}</td>")
+        h.append(f"<tr><td title='{tip}'>{escape(r['name'])}</td><td>{r['top_m']}</td><td>{x['days'][0]['status']}<br><span class='fine'>{escape(live_txt(r))}</span></td>")
         for d in x["days"]:
             dal = f"; dal +{d['total_b']:.0f} cm" if d["total_b"] is not None else ""
             t = (f"{d['fresh'][0]:.0f} cm vers bovenaan ({d['fresh'][1]:.0f}-{d['fresh'][2]:.0f}); dag +{d['total'][0]:.0f} cm{dal}; "
@@ -798,10 +936,14 @@ def main():
     ap.add_argument("--always", action="store_true", help="altijd melden, ook als er niets nieuws is")
     ap.add_argument("--no-notify", action="store_true")
     ap.add_argument("--demo", action="store_true", help="offline testdata, geen netwerk")
+    ap.add_argument("--no-live", action="store_true", help="geen live openingsstatus van Magic Pass ophalen")
+    ap.add_argument("--live-url", default=MP_URL, help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     resorts = load_resorts(a.resorts, a.tier)
     print(f"{len(resorts)} gebieden (tier <= {a.tier})")
+    if not a.no_live:
+        attach_live(resorts, fetch_magicpass_live(a.live_url))
     models = MODELS if a.demo else probe_models(MODELS)
     if not models:
         sys.exit("Geen enkel weermodel bereikbaar. Controleer je internetverbinding.")
