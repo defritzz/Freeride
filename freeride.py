@@ -74,13 +74,14 @@ class _Cards(HTMLParser):
     # Verzamelt de tekst van elke gebiedskaart (een link naar /stations/<naam>-<nummer>).
     def __init__(self):
         super().__init__()
-        self.cards, self._cur, self._buf = {}, None, []
+        self.cards, self._cur, self._buf, self._href = {}, None, [], ""
 
     def handle_starttag(self, tag, attrs):
         if tag == "a" and self._cur is None:
-            m = re.search(r"/stations/([a-z0-9-]+?)-(\d+)/?$", dict(attrs).get("href") or "")
+            href = dict(attrs).get("href") or ""
+            m = re.search(r"/stations/([a-z0-9-]+?)-(\d+)/?$", href)
             if m:
-                self._cur, self._buf = m.group(1), []
+                self._cur, self._buf, self._href = m.group(1), [], href
 
     def handle_data(self, data):
         if self._cur is not None:
@@ -88,7 +89,7 @@ class _Cards(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag == "a" and self._cur is not None:
-            self.cards[self._cur] = " ".join(" ".join(self._buf).split())
+            self.cards[self._cur] = {"text": " ".join(" ".join(self._buf).split()), "href": self._href}
             self._cur = None
 
 
@@ -115,7 +116,8 @@ def fetch_magicpass_live(url=MP_URL, max_pages=15):
             new = {k: v for k, v in parser.cards.items() if k not in live}
             if not new:
                 break
-            live.update({k: parse_card(v) for k, v in new.items()})
+            live.update({k: dict(parse_card(v["text"]), url=urllib.parse.urljoin("https://www.magicpass.ch/", v["href"]))
+                         for k, v in new.items()})
             time.sleep(1)
     except Exception as e:
         print(f"Magic Pass-openingen niet opgehaald ({e}); ik gebruik resorts.csv.", file=sys.stderr)
@@ -159,6 +161,254 @@ def live_txt(r):
     if i.get("lifts"):
         parts.append(f"liften {i['lifts'][0]}/{i['lifts'][1]}")
     return ", ".join(parts)
+
+
+
+# ----------------------------------- gemeten sneeuwhoogte (Switzerland Tourism)
+ST_BASE = "https://snow.myswitzerland.com"
+ST_LIST = "{base}/snow_reports/?p={p}&noidx="
+ST_META = {"ok": False, "time": "", "unmatched": [], "n": 0}
+ST_ALIASES = {}  # eigen naam (slug) -> naam bij Switzerland Tourism, als de automatische koppeling mist
+STOP = {"les", "la", "le", "de", "du", "des", "bergbahnen", "ski"}
+
+
+class _Flow(HTMLParser):
+    # Geeft elke link naar een sneeuwrapport de tekst die er net voor stond (de kaart van dat gebied).
+    def __init__(self):
+        super().__init__()
+        self.cards, self._buf, self._href, self._skip = {}, [], None, 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        if tag == "a":
+            self._href = dict(attrs).get("href") or ""
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        if tag == "a" and self._href is not None:
+            m = re.search(r"/snow_reports/([a-z0-9-]+?)-(\d+)/?(?:\?|$)", self._href)
+            if m:
+                if m.group(1) not in self.cards:
+                    self.cards[m.group(1)] = {"href": self._href.split("?")[0],
+                                               "text": " ".join(" ".join(self._buf).split())[-600:]}
+                self._buf = []
+            self._href = None
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._buf.append(data)
+
+
+class _Text(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.t, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        self.skip += tag in ("script", "style")
+
+    def handle_endtag(self, tag):
+        self.skip = max(0, self.skip - (tag in ("script", "style")))
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.t.append(data)
+
+
+def html_text(html):
+    p = _Text()
+    p.feed(html)
+    return " ".join(" ".join(p.t).split())
+
+
+def parse_st_card(text):
+    d = re.search(r"Depth of snow\s*(\d+)\s*cm\s*(\d+)\s*cm in resort", text)
+    km = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*km", text)
+    st = re.search(r"Season start:\s*(\d{2})\.(\d{2})\.(\d{4})", text)
+    return {"ov_top": float(d.group(1)) if d else None, "ov_val": float(d.group(2)) if d else None,
+            "km": (float(km.group(1)), float(km.group(2))) if km else None,
+            "start": f"{st.group(3)}-{st.group(2)}-{st.group(1)}" if st else None}
+
+
+def parse_st_detail(text):
+    def g(pat):
+        m = re.search(pat, text)
+        return float(m.group(1)) if m else None
+    val = re.search(r"Depth of snow in resort(?: at (\d+) metres)?\s*(\d+)\s*cm", text)
+    upd = re.search(r"Last update:\s*([0-9.]+,\s*[0-9:]+)", text)
+    return {"val": float(val.group(2)) if val else None,
+            "val_m": int(val.group(1)) if val and val.group(1) else None,
+            "top": g(r"Depth of snow on upper runs\s*(\d+)\s*cm"),
+            "new_val": g(r"New snow in resort \(past 24h\)\s*(\d+)\s*cm"),
+            "new_top": g(r"New snow in ski area \(past 24h\)\s*(\d+)\s*cm"),
+            "updated": upd.group(1) if upd else None}
+
+
+def _get(url):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; magicpass-freeride/1.0)", "Accept-Language": "en"})
+    return urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+
+
+def fetch_st_overview(base=ST_BASE, max_pages=10):
+    cards = {}
+    for pg in range(1, max_pages + 1):
+        p = _Flow()
+        p.feed(_get(ST_LIST.format(base=base, p=pg)))
+        new = {k: v for k, v in p.cards.items() if k not in cards}
+        if not new:
+            break
+        for k, v in new.items():
+            cards[k] = dict(parse_st_card(v["text"]), url=urllib.parse.urljoin(base + "/", v["href"]))
+        time.sleep(1)
+    return cards
+
+
+def _tok(t):
+    return {w for w in slugify(t).split("-") if w and w not in STOP}
+
+
+def find_st(name, cards):
+    a = _tok(ST_ALIASES.get(slugify(name), name))
+    best = None
+    for slug, c in cards.items():
+        b = _tok(slug)
+        inter = len(a & b)
+        if a and b and inter == min(len(a), len(b)):
+            jac = inter / len(a | b)
+            if best is None or jac > best[0]:
+                best = (jac, c)
+    return best[1] if best else None
+
+
+def attach_snowreports(resorts, base=ST_BASE):
+    try:
+        cards = fetch_st_overview(base)
+    except Exception as e:
+        print(f"Sneeuwrapporten niet opgehaald ({e}).", file=sys.stderr)
+        cards = {}
+    ok = len(cards) >= 20
+    miss, n = [], 0
+    for r in resorts:
+        r["st"] = None
+        if not ok:
+            continue
+        c = find_st(r["name"], cards)
+        if not c:
+            miss.append(r["name"])
+            continue
+        st = dict(c)
+        if st.get("ov_top") is not None or st.get("km"):  # open: haal de details op
+            try:
+                st.update({k: v for k, v in parse_st_detail(html_text(_get(c["url"]))).items() if v is not None})
+                time.sleep(1)
+            except Exception as e:
+                print(f"  sneeuwrapport {r['name']} mislukt: {e}", file=sys.stderr)
+        st["top"] = st.get("top", st.get("ov_top"))
+        st["val"] = st.get("val", st.get("ov_val"))
+        r["st"] = st
+        n += 1
+    ST_META.update(ok=ok, time=now_local().strftime("%H:%M"), unmatched=miss, n=n)
+    print(f"Sneeuwrapporten: {len(cards)} gebieden gelezen, {n} gekoppeld"
+          + (f", niet gevonden: {', '.join(miss)}" if miss else "") if ok else
+          "Sneeuwrapporten: geen bruikbare gegevens (geen gemeten sneeuwhoogtes in het rapport).")
+
+
+def depth_plain(r):
+    st = r.get("st") or {}
+    parts = []
+    if st.get("val") is not None:
+        parts.append(f"dal {st['val']:.0f} cm")
+    if st.get("top") is not None:
+        parts.append(f"top {st['top']:.0f} cm")
+    return (", ligt nu (gemeten): " + ", ".join(parts)) if parts else ""
+
+
+def depth_cell(r):
+    st = r.get("st") or {}
+    parts = []
+    if st.get("val") is not None:
+        parts.append(f"dal {st['val']:.0f} cm" + (f" ({st['val_m']} m)" if st.get("val_m") else ""))
+    if st.get("top") is not None:
+        parts.append(f"top {st['top']:.0f} cm")
+    return ", ".join(parts)
+
+
+def depth_html(r):
+    c = depth_cell(r)
+    if not c:
+        return "<br><span class='fine'>geen sneeuwmeting gevonden</span>"
+    st = r["st"]
+    new = ""
+    if st.get("new_val") is not None or st.get("new_top") is not None:
+        new = f"; nieuw in 24 u: dal {st.get('new_val') or 0:.0f} cm, top {st.get('new_top') or 0:.0f} cm"
+    upd = f" (bijgewerkt {st['updated']})" if st.get("updated") else ""
+    return f"<br><span class='bl'>Ligt nu, gemeten door het gebied: {escape(c)}{escape(new)}</span><span class='fine'>{escape(upd)}</span>"
+
+
+def opening_soon(results, today, horizon=7):
+    end = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=horizon)).strftime("%Y-%m-%d")
+    out = []
+    for x in results:
+        r = x["r"]
+        if x["days"] and x["days"][0]["status"] == "open":
+            continue
+        st = r.get("st") or {}
+        cands = []
+        if st.get("start"):
+            cands.append((st["start"], "seizoensstart volgens het gebied (Switzerland Tourism)"))
+        if r["maybe"]:
+            cands.append((r["maybe"], "voorwaardelijk volgens Magic Pass, bij genoeg sneeuw"))
+        if r["opens"]:
+            cands.append((r["opens"], "geplande opening volgens Magic Pass"))
+        cands = [c for c in cands if today <= c[0] <= end]
+        if cands:
+            d, t = min(cands)
+            out.append((d, x, t, bool(r["opens"]) and d < r["opens"]))
+    return sorted(out, key=lambda z: (z[0], z[1]["r"]["name"]))
+
+
+def opening_card(results, today):
+    m = LIVE_META
+    h = ["<section class='card'><h2>Nu open volgens Magic Pass</h2>"]
+    if not m["ok"]:
+        h.append("<p class='fine'>De live openingsstatus van Magic Pass kon niet worden opgehaald. Ik gebruik de data in resorts.csv, "
+                 "die verouderd kan zijn. Check magicpass.ch/fr/stations/opening.</p>")
+    else:
+        rows = sorted([x for x in results if (x["r"].get("live") or {}).get("km") and x["r"]["live"]["km"][0] > 0],
+                      key=lambda x: -x["r"]["live"]["km"][0])
+        li = "".join(f"<li><b>{escape(x['r']['name'])}</b>: {escape(live_txt(x['r']))}</li>" for x in rows) \
+            or "<li>Geen enkel gebied heeft nu pistes open.</li>"
+        h.append(f"<ul>{li}</ul><p class='fine'>Live opgehaald om {m['time']} bij Magic Pass (installaties en kilometer piste open). "
+                 "Een gebied met 0 km piste telt als dicht voor skiën.</p>")
+        if m["unmatched"]:
+            h.append("<p class='fine'>Niet teruggevonden op de Magic Pass-pagina (data uit resorts.csv): "
+                     + escape(", ".join(m["unmatched"])) + ".</p>")
+    soon = opening_soon(results, today)
+    h.append("<h3 style='font-size:.95rem;margin:12px 0 4px'>Opent binnen 7 dagen</h3>")
+    if soon:
+        h.append("<ul>")
+        for d, x, t, early in soon:
+            r = x["r"]
+            dd = f"{d[8:]}/{d[5:7]}"
+            snow = f"; onderaan +{x['ahead_b'][0]:.0f} cm verwacht (72 u)" if x.get("ahead_b") else ""
+            links = []
+            if (r.get("live") or {}).get("url"):
+                links.append(f"<a href='{escape(r['live']['url'])}'>Magic Pass</a>")
+            if (r.get("st") or {}).get("url"):
+                links.append(f"<a href='{escape(r['st']['url'])}'>sneeuwrapport</a>")
+            early_t = f" <b>(vroeger dan de officiële datum {r['opens'][8:]}/{r['opens'][5:7]})</b>" if early else ""
+            h.append(f"<li>{dd}: <b>{escape(r['name'])}</b>, {t}{early_t}{snow}"
+                     + (f" ({', '.join(links)})" if links else "") + "</li>")
+        h.append("</ul>")
+    else:
+        h.append("<p class='fine' style='margin:0'>Geen gebied met een geplande of voorwaardelijke opening in de komende 7 dagen.</p>")
+    h.append("<p class='fine'>Vervroegde openingen worden vaak pas op de sociale media of de eigen site van het gebied aangekondigd. "
+             "Die kan ik niet automatisch lezen: check de links hierboven of de socials van het gebied. "
+             f"Seizoensstarts komen van Switzerland Tourism ({ST_META['time'] or 'niet opgehaald'}, gemeld door de gebieden).</p></section>")
+    return "".join(h)
 
 
 
@@ -497,7 +747,7 @@ def build_message(top, best, hours, ndays):
                 extra += f", stuifsneeuw {'/'.join(d0['lee'])}"
         lt = live_txt(r)
         lines.append(f"- {r['name']} ({(d0['status'] if d0 else '?') + (', ' + lt if lt else '')}): bovenaan ({r['top_m']} m) "
-                     f"+{a[0]:.0f} cm ({a[1]:.0f}-{a[2]:.0f}){dal}{extra}")
+                     f"+{a[0]:.0f} cm ({a[1]:.0f}-{a[2]:.0f}){dal}{extra}{depth_plain(r)}")
     lines.append("")
     lines.append(f"Beste freeride-dagen (open of mogelijk open) in de komende {ndays} dagen:")
     for sc, x, d in best:
@@ -705,8 +955,8 @@ CITIES = [("Genève", 6.14, 46.20), ("Lausanne", 6.63, 46.52), ("Bern", 7.45, 46
           ("Luzern", 8.31, 47.05), ("Zürich", 8.54, 47.37), ("Montreux", 6.91, 46.43), ("Martigny", 7.07, 46.10),
           ("Brig", 7.99, 46.32), ("Interlaken", 7.86, 46.69), ("Fribourg", 7.15, 46.80)]
 LON0, LON1, LAT0, LAT1 = 5.8, 9.0, 45.8, 47.5
-STEPS = [(0.5, "h1"), (2, "h2"), (5, "h3"), (10, "h4"), (20, "h5"), (30, "h6"), (50, "h7"), (80, "h8")]
-LEGEND = [("0,5", "h1"), ("2", "h2"), ("5", "h3"), ("10", "h4"), ("20", "h5"), ("30", "h6"), ("50", "h7"), ("80+", "h8")]
+STEPS = [(0.5, "h1"), (2, "h2"), (5, "h3"), (10, "h4"), (20, "h5"), (30, "h6"), (50, "h7"), (80, "h8"), (120, "h9")]
+LEGEND = [("0,5", "h1"), ("2", "h2"), ("5", "h3"), ("10", "h4"), ("20", "h5"), ("30", "h6"), ("50", "h7"), ("80", "h8"), ("120+", "h9")]
 
 
 def klass(v):
@@ -742,7 +992,18 @@ def heat(pts, W, H, cols=48):
     return "".join(f'<path class="{k}" d="{"".join(v)}"/>' for k, v in paths.items())
 
 
-def svg_map(results, di, W=420):
+def cellval(x, di, key):
+    # di=None: gecumuleerd over alle dagen
+    if di is None:
+        vs = [(d[key][0] if isinstance(d[key], tuple) else d[key]) for d in x["days"] if d[key] is not None]
+        return sum(vs) if vs else None
+    if di >= len(x["days"]):
+        return None
+    v = x["days"][di][key]
+    return v[0] if isinstance(v, tuple) else v
+
+
+def svg_map(results, di=None, W=420, nlab=3):
     H = int(W * (LAT1 - LAT0) * 111 / ((LON1 - LON0) * 76))
     px = lambda lon: (lon - LON0) / (LON1 - LON0) * W
     py = lambda lat: (LAT1 - lat) / (LAT1 - LAT0) * H
@@ -755,27 +1016,38 @@ def svg_map(results, di, W=420):
         out.append(f'<line x1="0" y1="{py(lat):.1f}" x2="{W}" y2="{py(lat):.1f}" class="ch"/>'
                    f'<text x="2" y="{py(lat) - 2:.1f}" class="gl">{lat}°N</text>')
     for layer, key in (("top", "total"), ("base", "total_b")):
-        rows = []
-        for x in results:
-            if di < len(x["days"]):
-                v = x["days"][di][key]
-                v = v[0] if isinstance(v, tuple) else v
-                if v is not None:
-                    rows.append((v, x))
+        rows = [(v, x) for x in results for v in [cellval(x, di, key)] if v is not None]
+        ranked = sorted(rows, key=lambda t: -t[0])
+        named = {id(x) for v, x in ranked[:nlab] if v >= 5}
         out.append(f'<g class="L {layer}">' + heat([(x["r"]["lon"], x["r"]["lat"], v) for v, x in rows], W, H))
         for v, x in rows:
             r = x["r"]
-            cls = "dot" if x["days"][di]["status"] != "dicht" else "dot closed"
+            closed = x["days"] and x["days"][0]["status"] == "dicht"
+            cls = "dot" + (" closed" if closed else "") + (" hot" if id(x) in named else "")
             out.append(f'<circle cx="{px(r["lon"]):.1f}" cy="{py(r["lat"]):.1f}" r="2.6" class="{cls}">'
                        f'<title>{escape(r["name"])}: {v:.0f} cm</title></circle>')
-            if r["tier"] == 1 and v >= 3:
+            if r["tier"] == 1 and v >= 3 and id(x) not in named:
                 out.append(f'<text x="{px(r["lon"]) + 4:.1f}" y="{py(r["lat"]) - 3:.1f}" class="vl">{v:.0f}</text>')
-        for k, (v, x) in enumerate(sorted(rows, key=lambda t: -t[0])[:2]):
-            if v >= 5:
-                r = x["r"]
-                out.append(f'<text x="{px(r["lon"]) + 9:.1f}" y="{py(r["lat"]) + 12 + 11 * k:.1f}" class="lb">'
-                           f'{escape(r["name"].split(" (")[0])} {v:.0f} cm</text>')
+        placed = []  # namen van de gebieden met de meeste sneeuw, zonder elkaar te overlappen
+        for v, x in ranked[:nlab]:
+            if v < 5:
+                continue
+            r = x["r"]
+            cx, cy = px(r["lon"]), py(r["lat"])
+            txt = f'{r["name"].split(" (")[0]} {v:.0f} cm'
+            w = 6.3 * len(txt) + 4
+            for dx, dy in ((8, -4), (8, 14), (-8 - w, -4), (-8 - w, 14), (8, 28), (-8 - w, 28), (8, -18), (-8 - w, -18)):
+                x0, y0 = cx + dx, cy + dy
+                box = (x0, y0 - 11, x0 + w, y0 + 3)
+                if box[0] < 0 or box[2] > W or box[1] < 0 or box[3] > H:
+                    continue
+                if any(not (box[2] < b[0] or box[0] > b[2] or box[3] < b[1] or box[1] > b[3]) for b in placed):
+                    continue
+                placed.append(box)
+                out.append(f'<text x="{x0:.1f}" y="{y0:.1f}" class="lb">{escape(txt)}</text>')
+                break
         out.append("</g>")
+
     def road_d(lines):
         return "".join("M" + "L".join(f"{px(a):.1f} {py(b):.1f}" for a, b in ln) for ln in lines)
     out.append(f'<path d="{road_d(ROADS_SEC)}" class="rs"/><path d="{road_d(ROADS_MAJOR)}" class="rm"/>')
@@ -795,9 +1067,9 @@ def cell_class(sc, status):
 
 CSS = """
 :root{--bg:#f4f7fa;--card:#fff;--tx:#14202b;--mu:#5b6b79;--ln:#dbe3ea;--ac:#1c6fd1;color-scheme:light;
---g:#c9ecd6;--y:#e7efbf;--o:#fbe1b4;--r:#f6c9c4;--x:#e8ecf0}
+--g:#c9ecd6;--y:#e7efbf;--o:#fbe1b4;--r:#f6c9c4;--x:#e8ecf0;--bl:#1c6fd1;--ok:#1f8a4c;--wn:#b36200;--bad:#c0392b}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1720;--card:#18232f;--tx:#e8eef4;--mu:#9fb0bf;--ln:#2a3947;
---ac:#6aa9f5;color-scheme:dark;--g:#1f4a33;--y:#46502a;--o:#58431d;--r:#5a2a26;--x:#222d38}}
+--ac:#6aa9f5;color-scheme:dark;--g:#1f4a33;--y:#46502a;--o:#58431d;--r:#5a2a26;--x:#222d38;--bl:#6aa9f5;--ok:#4cc27f;--wn:#e0a83c;--bad:#f07a6c}}
 body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1000px;margin:0 auto;padding:18px 14px 40px}h1{margin:.2em 0}h2{font-size:1.1rem;margin:0 0 .6em}
 .card{background:var(--card);border:1px solid var(--ln);border-radius:12px;padding:14px;margin:0 0 14px}
@@ -807,7 +1079,7 @@ th,td{padding:6px 8px;border-bottom:1px solid var(--ln);text-align:left;vertical
 .maps{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.maps h3{font-size:.9rem;margin:0 0 2px}
 .maps:not(.show-base) .base,.maps.show-base .top{display:none}
 svg{width:100%;height:auto;background:var(--bg);border-radius:8px}.ch{stroke:var(--ln);stroke-width:1;stroke-dasharray:3 3}
-.h1{fill:#cfe6ff}.h2{fill:#9fcbff}.h3{fill:#6fb0ff}.h4{fill:#3f8bf0}.h5{fill:#2f5fd0}.h6{fill:#6a3fc8}.h7{fill:#a02fb5}.h8{fill:#d6336c}
+.h1{fill:#cfe6ff}.h2{fill:#9fcbff}.h3{fill:#6fb0ff}.h4{fill:#3f8bf0}.h5{fill:#2f5fd0}.h6{fill:#6a3fc8}.h7{fill:#a02fb5}.h8{fill:#d6336c}.h9{fill:#8a1f63}
 svg path[class^="h"]{fill-opacity:.85}.bd{fill:none;stroke:var(--tx);stroke-width:1.3}.rm{fill:none;stroke:#c0392b;stroke-width:1.6;opacity:.9}.rs{fill:none;stroke:var(--mu);stroke-width:.9;opacity:.8}
 .dot{fill:var(--card);stroke:var(--tx);stroke-width:1}.dot.closed{fill:none;stroke-dasharray:2 1.5;opacity:.7}
 .gl{fill:var(--mu);font-size:9px}.city{fill:var(--mu)}.vl{fill:var(--tx);font-size:9px;font-weight:600}
@@ -816,28 +1088,13 @@ svg path[class^="h"]{fill-opacity:.85}.bd{fill:none;stroke:var(--tx);stroke-widt
 .tg button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
 .lg{display:flex;gap:0;margin:8px 0;font-size:.75rem}.lg span{padding:2px 8px;color:#fff;text-shadow:0 0 2px #000}
 ul{margin:.3em 0;padding-left:1.2em}
+.maps .wide{grid-column:1/-1}.dot.hot{stroke:var(--ac);stroke-width:2.4}
+.bl{color:var(--bl);font-weight:600}.n-open{color:var(--ok);font-weight:600}.n-maybe{color:var(--wn);font-weight:600}.n-closed{color:var(--bad);font-weight:600}
 """
 
 
 def fmt(st):
     return "-" if not st else f"+{st[0]:.0f} cm ({st[1]:.0f}-{st[2]:.0f})"
-
-
-def opening_card(results):
-    m = LIVE_META
-    if not m["ok"]:
-        return ("<section class='card'><h2>Openingen</h2><p class='fine' style='margin:0'>De live openingsstatus van Magic Pass kon niet worden "
-                "opgehaald. Ik gebruik de data in resorts.csv, die verouderd kan zijn. Check magicpass.ch/fr/stations/opening.</p></section>")
-    rows = sorted([x for x in results if (x["r"].get("live") or {}).get("km") and x["r"]["live"]["km"][0] > 0],
-                  key=lambda x: -x["r"]["live"]["km"][0])
-    li = "".join(f"<li><b>{escape(x['r']['name'])}</b>: {escape(live_txt(x['r']))}</li>" for x in rows) or "<li>Geen enkel gebied heeft nu pistes open.</li>"
-    miss = ""
-    if m["unmatched"]:
-        miss = ("<p class='fine'>Niet teruggevonden op de Magic Pass-pagina (data uit resorts.csv): "
-                + escape(", ".join(m["unmatched"])) + ".</p>")
-    return (f"<section class='card'><h2>Nu open volgens Magic Pass</h2><ul>{li}</ul>"
-            f"<p class='fine'>Live opgehaald om {m['time']} bij Magic Pass (installaties en kilometer piste open). "
-            f"Een gebied met 0 km piste telt als dicht voor skiën. Voor latere dagen gelden de geplande openingsdata uit resorts.csv.</p>{miss}</section>")
 
 
 def render(results, top, best, models, hours, out_path, ndays):
@@ -854,24 +1111,26 @@ def render(results, top, best, models, hours, out_path, ndays):
         i = dates.index(d["date"])
         dal = f", {d['fresh_b'][0]:.0f} cm vers in het dal" if d["fresh_b"] else ""
         h.append(f"<li><b>{lab[i]}: {escape(x['r']['name'])}</b> (score {sc}/100, {d['fresh'][0]:.0f} cm vers bovenaan{dal}, {d['status']})"
-                 + "".join(f"<br><span class='fine'>{escape(f)}</span>" for f in d["flags"]) + "</li>")
+                 + "".join(f"<br><span class='fine'>{escape(f)}</span>" for f in d["flags"]) + depth_html(x["r"]) + "</li>")
     if not best:
         h.append("<li>Geen enkel gebied is open of mogelijk open in deze periode.</li>")
     h.append("</ul></section>")
-    h.append(opening_card(results))
+    h.append(opening_card(results, now_local().strftime("%Y-%m-%d")))
     h.append(f"<section class='card'><h2>Sneeuw op komst, komende {hours} uur</h2><div class='wrap'><table>"
-             "<tr><th>Gebied</th><th>Status</th><th>Bovenaan</th><th>Onderaan (dal)</th><th>Sneeuwgrens</th><th>Windstoten</th><th>Lijzijde</th></tr>")
+             "<tr><th>Gebied</th><th>Status</th><th>Bovenaan</th><th>Onderaan (dal)</th><th>Ligt nu (gemeten)</th><th>Sneeuwgrens</th><th>Windstoten</th><th>Lijzijde</th></tr>")
     for x in top:
         d0 = x["days"][0]
         r = x["r"]
         h.append(f"<tr><td>{escape(r['name'])}</td><td>{d0['status']}<br><span class='fine'>{escape(live_txt(r))}</span></td><td>{r['top_m']} m: {fmt(x['ahead'])}</td>"
-                 f"<td>{r['base_m']} m: {fmt(x['ahead_b'])}</td><td>{d0['fl_min']:.0f} m</td><td>{d0['gust']:.0f} km/u</td>"
+                 f"<td>{r['base_m']} m: {fmt(x['ahead_b'])}</td><td class='bl'>{escape(depth_cell(r)) or '-'}</td><td>{d0['fl_min']:.0f} m</td><td>{d0['gust']:.0f} km/u</td>"
                  f"<td>{'/'.join(d0['lee']) if d0['lee'] else '-'}</td></tr>")
     h.append("</table></div></section><section class='card'><h2>Sneeuwkaarten: nieuwe sneeuw per dag (cm)</h2>"
              "<div class='tg'><button id='bt' class='on' onclick=\"sw('top')\">Bovenaan</button>"
              "<button id='bb' onclick=\"sw('base')\">Onderaan (dal)</button></div>"
              "<div class='lg'>" + "".join(f"<span class='{k}' style='background:var(--lg)' data-k='{k}'>{t}</span>" for t, k in LEGEND) +
              "</div><div class='maps'>")
+    h.append(f"<div class='wide'><h3>Totaal komende {len(dates)} dagen (gecumuleerd), met de gebieden met de meeste sneeuw</h3>"
+             f"{svg_map(results, None, 560, 7)}</div>")
     for i in range(min(5, len(dates))):
         h.append(f"<div><h3>{lab[i]}</h3>{svg_map(results, i)}</div>")
     h.append("</div><p class='fine'>Kleur = geschatte nieuwe sneeuw (cm) over die dag, geïnterpoleerd tussen de gebieden en enkel getoond "
@@ -879,7 +1138,7 @@ def render(results, top, best, models, hours, out_path, ndays):
              "Dit is een model, geen meting.</p>"
              "<script>function sw(l){document.querySelector('.maps').classList.toggle('show-base',l==='base');"
              "document.getElementById('bt').classList.toggle('on',l==='top');document.getElementById('bb').classList.toggle('on',l==='base');}"
-             "var c={h1:'#cfe6ff',h2:'#9fcbff',h3:'#6fb0ff',h4:'#3f8bf0',h5:'#2f5fd0',h6:'#6a3fc8',h7:'#a02fb5',h8:'#d6336c'};"
+             "var c={h1:'#cfe6ff',h2:'#9fcbff',h3:'#6fb0ff',h4:'#3f8bf0',h5:'#2f5fd0',h6:'#6a3fc8',h7:'#a02fb5',h8:'#d6336c',h9:'#8a1f63'};"
              "document.querySelectorAll('.lg span').forEach(function(e){e.style.background=c[e.dataset.k];e.style.setProperty('--lg',c[e.dataset.k]);});"
              "</script></section>")
     h.append("<section class='card'><h2>Alle gebieden, score per dag</h2><div class='wrap'><table><tr><th>Gebied</th><th>Top</th><th>Status</th>"
@@ -888,7 +1147,9 @@ def render(results, top, best, models, hours, out_path, ndays):
     for x in order:
         r = x["r"]
         tip = escape(r.get("note") or "")
-        h.append(f"<tr><td title='{tip}'>{escape(r['name'])}</td><td>{r['top_m']}</td><td>{x['days'][0]['status']}<br><span class='fine'>{escape(live_txt(r))}</span></td>")
+        sts = [d["status"] for d in x["days"]]
+        ncls = "open" if sts[0] == "open" else "maybe" if any(t in ("open", "mogelijk") for t in sts) else "closed"
+        h.append(f"<tr><td class='n-{ncls}' title='{tip}'>{escape(r['name'])}</td><td>{r['top_m']}</td><td>{x['days'][0]['status']}<br><span class='fine'>{escape(live_txt(r))}</span></td>")
         for d in x["days"]:
             dal = f"; dal +{d['total_b']:.0f} cm" if d["total_b"] is not None else ""
             t = (f"{d['fresh'][0]:.0f} cm vers bovenaan ({d['fresh'][1]:.0f}-{d['fresh'][2]:.0f}); dag +{d['total'][0]:.0f} cm{dal}; "
@@ -896,7 +1157,7 @@ def render(results, top, best, models, hours, out_path, ndays):
                  f"sneeuwgrens {d['fl']:.0f} m. " + " | ".join(d["flags"]))
             h.append(f"<td class='{cell_class(d['score'], d['status'])}' title='{escape(t)}'>{d['score']} <span class='fine'>+{d['total'][0]:.0f}</span></td>")
         h.append("</tr>")
-    h.append("</table></div><p class='fine'>Cel = score/100 en nieuwe sneeuw bovenaan die dag. Grijs = gebied dicht volgens de openingsdata in resorts.csv. "
+    h.append("</table></div><p class='fine'>Naamkleur: <b class='n-open'>groen</b> = nu open, <b class='n-maybe'>oranje</b> = mogelijk open binnen de prognoseperiode, <b class='n-closed'>rood</b> = dicht. Cel = score/100 en nieuwe sneeuw bovenaan die dag. Grijs = gebied dicht volgens de openingsdata in resorts.csv. "
              "Score is een eigen heuristiek (poeder 45, zon 20, wind 20, temperatuur 10, sneeuwdek 5).</p></section>")
     h.append("<section class='card'><h2>Modelcontrole</h2><p class='fine' style='margin-top:0'>Nieuwe sneeuw (cm) in de komende "
              f"{hours} uur per weermodel, voor de 5 gebieden met de meeste sneeuw. Wijkt één model sterk af, dan telt dat niet mee in het bereik. "
@@ -938,12 +1199,14 @@ def main():
     ap.add_argument("--demo", action="store_true", help="offline testdata, geen netwerk")
     ap.add_argument("--no-live", action="store_true", help="geen live openingsstatus van Magic Pass ophalen")
     ap.add_argument("--live-url", default=MP_URL, help=argparse.SUPPRESS)
+    ap.add_argument("--st-base", default=ST_BASE, help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     resorts = load_resorts(a.resorts, a.tier)
     print(f"{len(resorts)} gebieden (tier <= {a.tier})")
     if not a.no_live:
         attach_live(resorts, fetch_magicpass_live(a.live_url))
+        attach_snowreports(resorts, a.st_base)
     models = MODELS if a.demo else probe_models(MODELS)
     if not models:
         sys.exit("Geen enkel weermodel bereikbaar. Controleer je internetverbinding.")
