@@ -37,7 +37,7 @@ TZ = "Europe/Zurich"
 # MeteoSwiss ICON is het fijnst voor de Alpen, ECMWF/ICON/GFS geven spreiding.
 MODELS = ["meteoswiss_icon_seamless", "ecmwf_ifs025", "icon_seamless", "gfs_seamless"]
 HOURLY = ["temperature_2m", "precipitation", "snowfall", "freezing_level_height", "wind_speed_10m",
-          "wind_gusts_10m", "wind_direction_10m", "cloud_cover", "snow_depth"]
+          "wind_gusts_10m", "wind_direction_10m", "cloud_cover", "snow_depth", "sunshine_duration", "is_day"]
 BASE_HOURLY = ["temperature_2m", "precipitation"]  # tweede ronde, op de hoogte van het dal
 
 
@@ -496,7 +496,11 @@ def mock_batch(batch, days, models, hourly_vars, elev):
                 cols["wind_speed_10m"].append(round(12 + 35 * p + rnd.uniform(0, 6), 1))
                 cols["wind_gusts_10m"].append(round(22 + 60 * p + rnd.uniform(0, 8), 1))
                 cols["wind_direction_10m"].append(round(255 + 20 * p + rnd.uniform(-10, 10)))
-                cols["cloud_cover"].append(round(min(100, 25 + 90 * min(1, p * 1.4) + rnd.uniform(0, 8))))
+                cc = round(min(100, 25 + 90 * min(1, p * 1.4) + rnd.uniform(0, 8)))
+                cols["cloud_cover"].append(cc)
+                day = 8 <= i % 24 <= 16
+                cols["is_day"].append(1 if day else 0)
+                cols["sunshine_duration"].append(round((100 - cc) / 100 * 3600) if day else 0)
                 cols["snow_depth"].append(round(depth, 2))
             for v in hourly_vars:
                 hourly[f"{v}_{m}" if len(models) > 1 else v] = cols[v]
@@ -647,6 +651,16 @@ def analyse(resort, raw, raw_base, models, ndays):
     def window(var, a, b):
         return [x for x in (at(var, i) for i in range(max(a, 0), min(b, n))) if x is not None]
 
+    def sun_hours(b):
+        # Uren zon op die dag: sunshine_duration van de modellen; zonder die waarde schat ik ze uit de bewolking.
+        idx = [i for i in range(b, min(b + 24, n)) if (at("is_day", i) or 0) >= 0.5] or list(range(b + 8, min(b + 17, n)))
+        if not idx:
+            return None
+        if L["sunshine_duration"]:
+            return avg([sum((l[i] or 0.0) for i in idx if i < len(l)) / 3600 for l in L["sunshine_duration"]])
+        cl = [c for c in (at("cloud_cover", i) for i in idx) if c is not None]
+        return sum(1 - c / 100 for c in cl) if cl else None
+
     base = {t[:10]: i for i, t in enumerate(times) if t.endswith("T00:00")}
     today = now_local().strftime("%Y-%m-%d")
     nowt = now_local().strftime("%Y-%m-%dT%H:00")
@@ -675,6 +689,7 @@ def analyse(resort, raw, raw_base, models, ndays):
             "temp": avg(window("temperature_2m", b + 9, b + 17)),
             "gust": max(window("wind_gusts_10m", b + 9, b + 17) or [0]),
             "cloud": avg(window("cloud_cover", b + 9, b + 17)),
+            "sun_h": sun_hours(b),
             "fl": avg(window("freezing_level_height", b + 9, b + 17)),
             "fl_min": min(window("freezing_level_height", b, b + 24) or [0]),
             "depth": depth * 100 if depth is not None else None,
@@ -1089,8 +1104,17 @@ svg path[class^="h"]{fill-opacity:.85}.bd{fill:none;stroke:var(--tx);stroke-widt
 .lg{display:flex;gap:0;margin:8px 0;font-size:.75rem}.lg span{padding:2px 8px;color:#fff;text-shadow:0 0 2px #000}
 ul{margin:.3em 0;padding-left:1.2em}
 .maps .wide{grid-column:1/-1}.dot.hot{stroke:var(--ac);stroke-width:2.4}
-.bl{color:var(--bl);font-weight:600}.n-open{color:var(--ok);font-weight:600}.n-maybe{color:var(--wn);font-weight:600}.n-closed{color:var(--bad);font-weight:600}
+.sun{font-size:.78rem;white-space:nowrap}.bl{color:var(--bl);font-weight:600}.n-open{color:var(--ok);font-weight:600}.n-maybe{color:var(--wn);font-weight:600}.n-closed{color:var(--bad);font-weight:600}
 """
+
+
+def sun_html(d):
+    h = d.get("sun_h")
+    if h is None:
+        return ""
+    if h < 1.0:
+        return "<br><span class='sun'>☁️ bewolkt</span>"
+    return "<br><span class='sun'>☀️ " + f"{h:.1f}".replace(".", ",") + " u</span>"
 
 
 def fmt(st):
@@ -1154,10 +1178,10 @@ def render(results, top, best, models, hours, out_path, ndays):
             dal = f"; dal +{d['total_b']:.0f} cm" if d["total_b"] is not None else ""
             t = (f"{d['fresh'][0]:.0f} cm vers bovenaan ({d['fresh'][1]:.0f}-{d['fresh'][2]:.0f}); dag +{d['total'][0]:.0f} cm{dal}; "
                  f"temp {d['temp'] if d['temp'] is None else round(d['temp'])} C; wind tot {d['gust']:.0f} km/u; "
-                 f"sneeuwgrens {d['fl']:.0f} m. " + " | ".join(d["flags"]))
-            h.append(f"<td class='{cell_class(d['score'], d['status'])}' title='{escape(t)}'>{d['score']} <span class='fine'>+{d['total'][0]:.0f}</span></td>")
+                 f"sneeuwgrens {d['fl']:.0f} m; zon {'onbekend' if d['sun_h'] is None else round(d['sun_h'], 1)} u. " + " | ".join(d["flags"]))
+            h.append(f"<td class='{cell_class(d['score'], d['status'])}' title='{escape(t)}'>{d['score']} <span class='fine'>+{d['total'][0]:.0f}</span>{sun_html(d)}</td>")
         h.append("</tr>")
-    h.append("</table></div><p class='fine'>Naamkleur: <b class='n-open'>groen</b> = nu open, <b class='n-maybe'>oranje</b> = mogelijk open binnen de prognoseperiode, <b class='n-closed'>rood</b> = dicht. Cel = score/100 en nieuwe sneeuw bovenaan die dag. Grijs = gebied dicht volgens de openingsdata in resorts.csv. "
+    h.append("</table></div><p class='fine'>Naamkleur: <b class='n-open'>groen</b> = nu open, <b class='n-maybe'>oranje</b> = mogelijk open binnen de prognoseperiode, <b class='n-closed'>rood</b> = dicht. Cel = score/100, nieuwe sneeuw bovenaan die dag, en daaronder ☀️ de uren zon of ☁️ bij een bewolkte dag (minder dan 1 uur zon). Grijs = gebied dicht volgens de openingsdata in resorts.csv. "
              "Score is een eigen heuristiek (poeder 45, zon 20, wind 20, temperatuur 10, sneeuwdek 5).</p></section>")
     h.append("<section class='card'><h2>Modelcontrole</h2><p class='fine' style='margin-top:0'>Nieuwe sneeuw (cm) in de komende "
              f"{hours} uur per weermodel, voor de 5 gebieden met de meeste sneeuw. Wijkt één model sterk af, dan telt dat niet mee in het bereik. "
